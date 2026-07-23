@@ -1,11 +1,10 @@
 {
-  "keywords": [
-    "Україна новини",
-    "політика України",
-    "Верховна Рада",
-    "уряд України",
-    "міжнародна підтримка України",
-    "переговори Україна"
+  "feeds": [
+    "https://www.pravda.com.ua/rss/",
+    "https://suspilne.media/rss/all.rss",
+    "https://www.unian.ua/rss/news_ukr.rss",
+    "https://tsn.ua/rss/full.rss",
+    "https://www.epravda.com.ua/rss/"
   ],
   "breaking_words": [
     "терміново",
