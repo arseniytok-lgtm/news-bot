@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
-News Poster
-Публікує одну свіжу новину з картинкою в Telegram-канал.
-Джерело: Google News RSS.
+Telegram News Bot
+Публікує ОДНУ свіжу новину з картинкою.
+Термінові новини йдуть першими з позначкою.
 """
 
+import html
 import json
 import os
-import sys
 import re
-import html
+import sys
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
@@ -18,267 +18,280 @@ from xml.etree import ElementTree
 
 import requests
 
-BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "")
-CHANNEL_ID = os.environ.get("TG_CHANNEL_ID", "")
+TOKEN = os.environ.get("TG_BOT_TOKEN", "")
+CHANNEL = os.environ.get("TG_CHANNEL_ID", "")
 
 BASE = Path(__file__).parent
-SOURCES_FILE = BASE / "sources.json"
-SEEN_FILE = BASE / "seen_news.json"
+CONFIG_FILE = BASE / "config.json"
+MEMORY_FILE = BASE / "memory.json"
 
-MAX_TITLE_LEN = 200
-
-# Новина вважається терміновою, якщо вийшла менш ніж N хвилин тому
 BREAKING_MINUTES = 45
+TITLE_LIMIT = 200
+MEMORY_LIMIT = 2000
 
-UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+BROWSER = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
 
 
 def log(msg):
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
-def load_sources():
-    if not SOURCES_FILE.exists():
-        log(f"ПОМИЛКА: немає {SOURCES_FILE}")
-        return {}
-    with open(SOURCES_FILE, encoding="utf-8") as f:
+# ---------- конфіг і пам'ять ----------
+
+def read_config():
+    if not CONFIG_FILE.exists():
+        log("ПОМИЛКА: немає config.json")
+        sys.exit(1)
+    with open(CONFIG_FILE, encoding="utf-8") as f:
         return json.load(f)
 
 
-def load_seen():
-    if not SEEN_FILE.exists():
+def read_memory():
+    if not MEMORY_FILE.exists():
         return []
     try:
-        with open(SEEN_FILE, encoding="utf-8") as f:
-            return json.load(f).get("seen", [])
+        with open(MEMORY_FILE, encoding="utf-8") as f:
+            return json.load(f).get("published", [])
     except Exception:
         return []
 
 
-def save_seen(seen):
-    with open(SEEN_FILE, "w", encoding="utf-8") as f:
-        json.dump({"seen": seen[-2000:]}, f, ensure_ascii=False, indent=2)
+def write_memory(links):
+    with open(MEMORY_FILE, "w", encoding="utf-8") as f:
+        json.dump({"published": links[-MEMORY_LIMIT:]}, f, ensure_ascii=False, indent=2)
 
 
-def clean_title(title):
-    title = html.unescape(title or "")
-    title = re.sub(r"<[^>]+>", "", title)
-    title = re.sub(r"\s+-\s+[^-]+$", "", title).strip()
-    if len(title) > MAX_TITLE_LEN:
-        title = title[:MAX_TITLE_LEN].rsplit(" ", 1)[0] + "…"
-    return title
+# ---------- новини ----------
+
+def tidy_title(raw):
+    text = html.unescape(raw or "")
+    text = re.sub(r"<[^>]+>", "", text)
+    text = re.sub(r"\s+-\s+[^-]+$", "", text).strip()
+    if len(text) > TITLE_LIMIT:
+        text = text[:TITLE_LIMIT].rsplit(" ", 1)[0] + "…"
+    return text
 
 
-def fetch_news(query, lang="uk", country="UA"):
+def search_news(query):
     url = (
-        f"https://news.google.com/rss/search?"
-        f"q={quote(query)}&hl={lang}&gl={country}&ceid={country}:{lang}"
+        "https://news.google.com/rss/search?"
+        f"q={quote(query)}&hl=uk&gl=UA&ceid=UA:uk"
     )
     try:
-        r = requests.get(url, timeout=20, headers={"User-Agent": UA})
-        r.raise_for_status()
-        root = ElementTree.fromstring(r.content)
-        items = []
-        for item in root.findall(".//item"):
-            t = item.find("title")
-            l = item.find("link")
-            s = item.find("source")
-            d = item.find("pubDate")
-            if t is None or l is None:
+        resp = requests.get(url, timeout=20, headers={"User-Agent": BROWSER})
+        resp.raise_for_status()
+        root = ElementTree.fromstring(resp.content)
+        found = []
+        for node in root.findall(".//item"):
+            title = node.find("title")
+            link = node.find("link")
+            source = node.find("source")
+            pubdate = node.find("pubDate")
+            if title is None or link is None:
                 continue
-            items.append({
-                "title": clean_title(t.text),
-                "link": (l.text or "").strip(),
-                "source": (s.text if s is not None else "") or "",
-                "pubdate": (d.text if d is not None else "") or "",
+            found.append({
+                "title": tidy_title(title.text),
+                "link": (link.text or "").strip(),
+                "source": (source.text if source is not None else "") or "",
+                "pubdate": (pubdate.text if pubdate is not None else "") or "",
             })
-        log(f"'{query}': знайдено {len(items)}")
-        return items
-    except Exception as e:
-        log(f"Помилка запиту '{query}': {e}")
+        log(f"'{query}' — знайдено {len(found)}")
+        return found
+    except Exception as exc:
+        log(f"Помилка пошуку '{query}': {exc}")
         return []
 
 
-def age_minutes(pubdate_str):
-    """Скільки хвилин тому вийшла новина. None якщо невідомо."""
-    if not pubdate_str:
+def minutes_old(pubdate):
+    if not pubdate:
         return None
     try:
-        dt = parsedate_to_datetime(pubdate_str)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        delta = datetime.now(timezone.utc) - dt
-        return delta.total_seconds() / 60
+        published = parsedate_to_datetime(pubdate)
+        if published.tzinfo is None:
+            published = published.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - published).total_seconds() / 60
     except Exception:
         return None
 
 
-def is_breaking(item, breaking_words):
-    """Чи термінова новина: за словами в заголовку або за свіжістю."""
-    title_low = item["title"].lower()
-    for w in breaking_words:
-        if w.lower() in title_low:
-            return True, f"слово '{w}'"
-    age = age_minutes(item.get("pubdate", ""))
+def check_breaking(item, words):
+    lowered = item["title"].lower()
+    for word in words:
+        if word.lower() in lowered:
+            return True, f"слово '{word}'"
+    age = minutes_old(item["pubdate"])
     if age is not None and age <= BREAKING_MINUTES:
-        return True, f"свіжа ({int(age)} хв)"
+        return True, f"свіжа, {int(age)} хв"
     return False, ""
 
 
-def resolve_url(google_link):
-    """Розгортає посилання Google News у справжню адресу статті."""
+# ---------- посилання і картинка ----------
+
+def unwrap_link(google_url):
+    """Розгортає Google News у справжню адресу статті."""
     try:
-        r = requests.get(google_link, timeout=15, headers={"User-Agent": UA}, allow_redirects=True)
-        final = r.url
+        resp = requests.get(
+            google_url, timeout=15, headers={"User-Agent": BROWSER}, allow_redirects=True
+        )
+        final = resp.url
         if "news.google.com" in final:
-            # інколи Google віддає HTML із редіректом усередині
-            m = re.search(r'<a[^>]+href="(https?://(?!news\.google)[^"]+)"', r.text)
-            if m:
-                final = html.unescape(m.group(1))
+            match = re.search(
+                r'<a[^>]+href="(https?://(?!news\.google|www\.google)[^"]+)"', resp.text
+            )
+            if match:
+                final = html.unescape(match.group(1))
             else:
-                m = re.search(r'url=(https?://[^"&]+)', r.text)
-                if m:
-                    final = html.unescape(m.group(1))
+                match = re.search(r'data-n-au="(https?://[^"]+)"', resp.text)
+                if match:
+                    final = html.unescape(match.group(1))
         return final
-    except Exception as e:
-        log(f"Не вдалось розгорнути посилання: {e}")
-        return google_link
+    except Exception as exc:
+        log(f"Не вдалось розгорнути посилання: {exc}")
+        return google_url
 
 
-def fetch_image(article_url):
-    """Дістає картинку зі сторінки статті (og:image)."""
-    if "news.google.com" in article_url:
+def grab_image(page_url):
+    """Дістає превʼю-картинку зі сторінки статті."""
+    if "news.google.com" in page_url:
+        log("Посилання не розгорнулось, картинки не буде")
         return None
     try:
-        r = requests.get(article_url, timeout=15, headers={"User-Agent": UA})
-        if r.status_code != 200:
+        resp = requests.get(page_url, timeout=15, headers={"User-Agent": BROWSER})
+        if resp.status_code != 200:
+            log(f"Сторінка віддала {resp.status_code}")
             return None
-        head = r.text[:200000]
+        head = resp.text[:250000]
         patterns = [
-            r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']',
-            r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image["\']',
-            r'<meta[^>]+name=["\']twitter:image["\'][^>]+content=["\']([^"\']+)["\']',
+            r'<meta[^>]+property=["\']og:image["\'][^>]*content=["\']([^"\']+)["\']',
+            r'<meta[^>]*content=["\']([^"\']+)["\'][^>]*property=["\']og:image["\']',
+            r'<meta[^>]+name=["\']twitter:image["\'][^>]*content=["\']([^"\']+)["\']',
+            r'<meta[^>]+property=["\']og:image:url["\'][^>]*content=["\']([^"\']+)["\']',
         ]
-        for p in patterns:
-            m = re.search(p, head, re.IGNORECASE)
-            if m:
-                img = html.unescape(m.group(1)).strip()
-                if img.startswith("//"):
-                    img = "https:" + img
-                elif img.startswith("/"):
-                    parsed = urlparse(article_url)
-                    img = f"{parsed.scheme}://{parsed.netloc}{img}"
-                if img.startswith("http"):
-                    return img
+        for pattern in patterns:
+            match = re.search(pattern, head, re.IGNORECASE)
+            if not match:
+                continue
+            image = html.unescape(match.group(1)).strip()
+            if image.startswith("//"):
+                image = "https:" + image
+            elif image.startswith("/"):
+                parts = urlparse(page_url)
+                image = f"{parts.scheme}://{parts.netloc}{image}"
+            if image.startswith("http"):
+                return image
+        log("og:image на сторінці немає")
         return None
-    except Exception as e:
-        log(f"Картинку не знайдено: {e}")
+    except Exception as exc:
+        log(f"Не вдалось отримати картинку: {exc}")
         return None
 
 
-def build_caption(item, link, breaking=False):
-    parts = []
-    if breaking:
-        parts.append("🔴 <b>ТЕРМІНОВО</b>")
-        parts.append("")
-    parts.append(f"<b>{html.escape(item['title'])}</b>")
-    parts.append("")
+# ---------- публікація ----------
+
+def make_text(item, link, urgent):
+    lines = []
+    if urgent:
+        lines.append("🔴 <b>ТЕРМІНОВО</b>")
+        lines.append("")
+    lines.append(f"<b>{html.escape(item['title'])}</b>")
+    lines.append("")
     if item["source"]:
-        parts.append(f"Джерело: {html.escape(item['source'])}")
-    parts.append(f'<a href="{link}">Читати повністю</a>')
-    return "\n".join(parts)
+        lines.append(f"Джерело: {html.escape(item['source'])}")
+    lines.append(f'<a href="{link}">Читати повністю</a>')
+    return "\n".join(lines)
 
 
-def send_photo(photo_url, caption):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
-    payload = {
-        "chat_id": CHANNEL_ID,
-        "photo": photo_url,
-        "caption": caption[:1024],
+def publish_photo(image_url, text):
+    api = f"https://api.telegram.org/bot{TOKEN}/sendPhoto"
+    body = {
+        "chat_id": CHANNEL,
+        "photo": image_url,
+        "caption": text[:1024],
         "parse_mode": "HTML",
     }
-    r = requests.post(url, json=payload, timeout=40)
-    return r.json()
+    return requests.post(api, json=body, timeout=40).json()
 
 
-def send_text(text):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": CHANNEL_ID,
+def publish_text(text):
+    api = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+    body = {
+        "chat_id": CHANNEL,
         "text": text,
         "parse_mode": "HTML",
         "disable_web_page_preview": False,
     }
-    r = requests.post(url, json=payload, timeout=30)
-    return r.json()
+    return requests.post(api, json=body, timeout=30).json()
 
+
+# ---------- головне ----------
 
 def main():
-    if not BOT_TOKEN or not CHANNEL_ID:
+    if not TOKEN or not CHANNEL:
         log("ПОМИЛКА: не задано TG_BOT_TOKEN або TG_CHANNEL_ID")
         sys.exit(1)
 
-    cfg = load_sources()
-    queries = cfg.get("keywords", [])
+    config = read_config()
+    queries = config.get("keywords", [])
+    urgent_words = config.get("breaking_words", [])
+
     if not queries:
-        log("Немає ключових слів у sources.json")
+        log("ПОМИЛКА: у config.json немає keywords")
         sys.exit(1)
 
-    breaking_words = cfg.get("breaking_words", [])
+    published = read_memory()
+    known = set(published)
 
-    seen = load_seen()
-    seen_set = set(seen)
+    fresh = []
+    for query in queries:
+        for item in search_news(query):
+            if item["link"] and item["link"] not in known:
+                fresh.append(item)
+                known.add(item["link"])
 
-    # Збираємо всі свіжі новини з усіх запитів
-    candidates = []
-    for q in queries:
-        for item in fetch_news(q):
-            if item["link"] and item["link"] not in seen_set:
-                candidates.append(item)
-                seen_set.add(item["link"])
-
-    if not candidates:
+    if not fresh:
         log("Нових новин немає")
         sys.exit(0)
 
-    # Шукаємо термінову
-    picked = None
-    is_urgent = False
-    for item in candidates:
-        urgent, reason = is_breaking(item, breaking_words)
-        if urgent:
-            picked = item
-            is_urgent = True
-            log(f"ТЕРМІНОВА: {reason}")
+    log(f"Нових новин у черзі: {len(fresh)}")
+
+    chosen = None
+    urgent = False
+    for item in fresh:
+        flag, reason = check_breaking(item, urgent_words)
+        if flag:
+            chosen, urgent = item, True
+            log(f"ТЕРМІНОВА ({reason})")
             break
 
-    if not picked:
-        picked = candidates[0]
+    if chosen is None:
+        chosen = fresh[0]
 
-    log(f"Обрано: {picked['title'][:60]}...")
+    log(f"Публікуємо: {chosen['title'][:70]}")
 
-    real_link = resolve_url(picked["link"])
-    log(f"Посилання: {real_link[:80]}")
+    article_url = unwrap_link(chosen["link"])
+    log(f"Стаття: {article_url[:90]}")
 
-    image = fetch_image(real_link)
-    caption = build_caption(picked, real_link, breaking=is_urgent)
+    image = grab_image(article_url)
+    text = make_text(chosen, article_url, urgent)
 
     if image:
-        log(f"Картинка: {image[:70]}")
-        res = send_photo(image, caption)
-        if not res.get("ok"):
-            log(f"Фото не пройшло ({res.get('description')}), надсилаю текстом")
-            res = send_text(caption)
+        log(f"Картинка знайдена: {image[:80]}")
+        result = publish_photo(image, text)
+        if not result.get("ok"):
+            log(f"Фото не пройшло ({result.get('description')}), надсилаю текстом")
+            result = publish_text(text)
     else:
-        log("Картинки немає, надсилаю текстом")
-        res = send_text(caption)
+        result = publish_text(text)
 
-    if res.get("ok"):
-        log("Опубліковано")
-        seen.append(picked["link"])
-        save_seen(seen)
+    if result.get("ok"):
+        log("Опубліковано успішно")
+        published.append(chosen["link"])
+        write_memory(published)
     else:
-        log(f"ПОМИЛКА Telegram: {res}")
+        log(f"ПОМИЛКА Telegram: {result}")
         sys.exit(1)
 
 
