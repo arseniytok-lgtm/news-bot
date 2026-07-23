@@ -1,4 +1,4 @@
-name: Новини в Telegram
+name: Новини
 
 on:
   schedule:
@@ -9,7 +9,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: news-publisher
+  group: news
   cancel-in-progress: false
 
 jobs:
@@ -24,20 +24,19 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Встановити залежності
-        run: pip install requests
+      - run: pip install requests
 
-      - name: Опублікувати новину
+      - name: Публікація
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHANNEL_ID: ${{ secrets.TG_CHANNEL_ID }}
-        run: python post_news.py
+        run: python news.py
 
-      - name: Зберегти пам'ять
+      - name: Збереження памʼяті
         run: |
           git config user.name "news-bot"
           git config user.email "bot@users.noreply.github.com"
           git pull --rebase --autostash || true
-          git add seen_news.json 2>/dev/null || true
-          git diff --staged --quiet || git commit -m "Опубліковано [skip ci]"
+          git add memory.json 2>/dev/null || true
+          git diff --staged --quiet || git commit -m "published [skip ci]"
           git push || true
