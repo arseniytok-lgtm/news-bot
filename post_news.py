@@ -182,9 +182,9 @@ def build_caption(item, link, breaking=False):
         parts.append("🔴 <b>ТЕРМІНОВО</b>")
         parts.append("")
     parts.append(f"<b>{html.escape(item['title'])}</b>")
-    if item["source"]:
-        parts.append(f"<i>{html.escape(item['source'])}</i>")
     parts.append("")
+    if item["source"]:
+        parts.append(f"Джерело: {html.escape(item['source'])}")
     parts.append(f'<a href="{link}">Читати повністю</a>')
     return "\n".join(parts)
 
