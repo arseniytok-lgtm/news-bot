@@ -1,0 +1,44 @@
+name: Новини в Telegram
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'   # кожні 15 хвилин
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: news-publisher
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Встановити залежності
+        run: pip install requests
+
+      - name: Опублікувати новини
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHANNEL_ID: ${{ secrets.TG_CHANNEL_ID }}
+        run: python post_news.py
+
+      - name: Зберегти пам'ять
+        run: |
+          git config user.name "news-bot"
+          git config user.email "bot@users.noreply.github.com"
+          git pull --rebase --autostash || true
+          git add seen_news.json 2>/dev/null || true
+          git diff --staged --quiet || git commit -m "Опубліковано [skip ci]"
+          git push || true
+
