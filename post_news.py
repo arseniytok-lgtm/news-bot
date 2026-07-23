@@ -10,7 +10,8 @@ import os
 import sys
 import re
 import html
-from datetime import datetime
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from urllib.parse import quote, urlparse
 from xml.etree import ElementTree
@@ -25,6 +26,10 @@ SOURCES_FILE = BASE / "sources.json"
 SEEN_FILE = BASE / "seen_news.json"
 
 MAX_TITLE_LEN = 200
+
+# Новина вважається терміновою, якщо вийшла менш ніж N хвилин тому
+BREAKING_MINUTES = 45
+
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
 
 
@@ -78,18 +83,46 @@ def fetch_news(query, lang="uk", country="UA"):
             t = item.find("title")
             l = item.find("link")
             s = item.find("source")
+            d = item.find("pubDate")
             if t is None or l is None:
                 continue
             items.append({
                 "title": clean_title(t.text),
                 "link": (l.text or "").strip(),
                 "source": (s.text if s is not None else "") or "",
+                "pubdate": (d.text if d is not None else "") or "",
             })
         log(f"'{query}': знайдено {len(items)}")
         return items
     except Exception as e:
         log(f"Помилка запиту '{query}': {e}")
         return []
+
+
+def age_minutes(pubdate_str):
+    """Скільки хвилин тому вийшла новина. None якщо невідомо."""
+    if not pubdate_str:
+        return None
+    try:
+        dt = parsedate_to_datetime(pubdate_str)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        delta = datetime.now(timezone.utc) - dt
+        return delta.total_seconds() / 60
+    except Exception:
+        return None
+
+
+def is_breaking(item, breaking_words):
+    """Чи термінова новина: за словами в заголовку або за свіжістю."""
+    title_low = item["title"].lower()
+    for w in breaking_words:
+        if w.lower() in title_low:
+            return True, f"слово '{w}'"
+    age = age_minutes(item.get("pubdate", ""))
+    if age is not None and age <= BREAKING_MINUTES:
+        return True, f"свіжа ({int(age)} хв)"
+    return False, ""
 
 
 def resolve_url(google_link):
@@ -143,8 +176,12 @@ def fetch_image(article_url):
         return None
 
 
-def build_caption(item, link):
-    parts = [f"<b>{html.escape(item['title'])}</b>"]
+def build_caption(item, link, breaking=False):
+    parts = []
+    if breaking:
+        parts.append("🔴 <b>ТЕРМІНОВО</b>")
+        parts.append("")
+    parts.append(f"<b>{html.escape(item['title'])}</b>")
     if item["source"]:
         parts.append(f"<i>{html.escape(item['source'])}</i>")
     parts.append("")
@@ -187,21 +224,36 @@ def main():
         log("Немає ключових слів у sources.json")
         sys.exit(1)
 
+    breaking_words = cfg.get("breaking_words", [])
+
     seen = load_seen()
     seen_set = set(seen)
 
-    picked = None
+    # Збираємо всі свіжі новини з усіх запитів
+    candidates = []
     for q in queries:
         for item in fetch_news(q):
             if item["link"] and item["link"] not in seen_set:
-                picked = item
-                break
-        if picked:
+                candidates.append(item)
+                seen_set.add(item["link"])
+
+    if not candidates:
+        log("Нових новин немає")
+        sys.exit(0)
+
+    # Шукаємо термінову
+    picked = None
+    is_urgent = False
+    for item in candidates:
+        urgent, reason = is_breaking(item, breaking_words)
+        if urgent:
+            picked = item
+            is_urgent = True
+            log(f"ТЕРМІНОВА: {reason}")
             break
 
     if not picked:
-        log("Нових новин немає")
-        sys.exit(0)
+        picked = candidates[0]
 
     log(f"Обрано: {picked['title'][:60]}...")
 
@@ -209,7 +261,7 @@ def main():
     log(f"Посилання: {real_link[:80]}")
 
     image = fetch_image(real_link)
-    caption = build_caption(picked, real_link)
+    caption = build_caption(picked, real_link, breaking=is_urgent)
 
     if image:
         log(f"Картинка: {image[:70]}")
