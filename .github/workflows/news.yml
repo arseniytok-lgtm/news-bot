@@ -2,7 +2,7 @@ name: Новини
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/8 * * * *"
+    - cron: "*/3,13,23,33,43,53 * * * *"
 permissions:
   contents: write
 jobs:
