@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Kresan News Poster
-Тягне свіжі новини за ключовими словами і публікує дайджест у канал.
-Джерело: Google News RSS (безкоштовно, без ключів).
+News Poster
+Публікує одну свіжу новину з картинкою в Telegram-канал.
+Джерело: Google News RSS.
 """
 
 import json
@@ -12,7 +12,7 @@ import re
 import html
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 from xml.etree import ElementTree
 
 import requests
@@ -24,8 +24,8 @@ BASE = Path(__file__).parent
 SOURCES_FILE = BASE / "sources.json"
 SEEN_FILE = BASE / "seen_news.json"
 
-MAX_NEWS_PER_POST = 2      # скільки новин в одному пості
-MAX_TITLE_LEN = 140        # обрізати задовгі заголовки
+MAX_TITLE_LEN = 200
+UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
 
 
 def log(msg):
@@ -51,16 +51,13 @@ def load_seen():
 
 
 def save_seen(seen):
-    # тримаємо тільки останні 300, щоб файл не ріс нескінченно
     with open(SEEN_FILE, "w", encoding="utf-8") as f:
         json.dump({"seen": seen[-2000:]}, f, ensure_ascii=False, indent=2)
 
 
 def clean_title(title):
-    """Прибирає HTML і назву джерела в кінці."""
-    title = html.unescape(title)
+    title = html.unescape(title or "")
     title = re.sub(r"<[^>]+>", "", title)
-    # Google News додає " - Джерело" в кінці
     title = re.sub(r"\s+-\s+[^-]+$", "", title).strip()
     if len(title) > MAX_TITLE_LEN:
         title = title[:MAX_TITLE_LEN].rsplit(" ", 1)[0] + "…"
@@ -68,26 +65,25 @@ def clean_title(title):
 
 
 def fetch_news(query, lang="uk", country="UA"):
-    """Тягне новини з Google News RSS за ключовим словом."""
     url = (
         f"https://news.google.com/rss/search?"
         f"q={quote(query)}&hl={lang}&gl={country}&ceid={country}:{lang}"
     )
     try:
-        r = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
+        r = requests.get(url, timeout=20, headers={"User-Agent": UA})
         r.raise_for_status()
         root = ElementTree.fromstring(r.content)
         items = []
         for item in root.findall(".//item"):
-            title_el = item.find("title")
-            link_el = item.find("link")
-            source_el = item.find("source")
-            if title_el is None or link_el is None:
+            t = item.find("title")
+            l = item.find("link")
+            s = item.find("source")
+            if t is None or l is None:
                 continue
             items.append({
-                "title": clean_title(title_el.text or ""),
-                "link": link_el.text or "",
-                "source": (source_el.text if source_el is not None else "") or "",
+                "title": clean_title(t.text),
+                "link": (l.text or "").strip(),
+                "source": (s.text if s is not None else "") or "",
             })
         log(f"'{query}': знайдено {len(items)}")
         return items
@@ -96,35 +92,88 @@ def fetch_news(query, lang="uk", country="UA"):
         return []
 
 
-def build_digest(news_items, header):
-    """Формує текст поста."""
-    lines = []
-    if header:
-        lines += [f"<b>{header}</b>", ""]
-    for n in news_items:
-        lines.append(f'<b>{html.escape(n["title"])}</b>')
-        if n["source"]:
-            lines.append(f'<i>{html.escape(n["source"])}</i>')
-        lines.append(f'<a href="{n["link"]}">Читати</a>')
-        lines.append("")
-    return "\n".join(lines).strip()
+def resolve_url(google_link):
+    """Розгортає посилання Google News у справжню адресу статті."""
+    try:
+        r = requests.get(google_link, timeout=15, headers={"User-Agent": UA}, allow_redirects=True)
+        final = r.url
+        if "news.google.com" in final:
+            # інколи Google віддає HTML із редіректом усередині
+            m = re.search(r'<a[^>]+href="(https?://(?!news\.google)[^"]+)"', r.text)
+            if m:
+                final = html.unescape(m.group(1))
+            else:
+                m = re.search(r'url=(https?://[^"&]+)', r.text)
+                if m:
+                    final = html.unescape(m.group(1))
+        return final
+    except Exception as e:
+        log(f"Не вдалось розгорнути посилання: {e}")
+        return google_link
 
 
-def send(text):
+def fetch_image(article_url):
+    """Дістає картинку зі сторінки статті (og:image)."""
+    if "news.google.com" in article_url:
+        return None
+    try:
+        r = requests.get(article_url, timeout=15, headers={"User-Agent": UA})
+        if r.status_code != 200:
+            return None
+        head = r.text[:200000]
+        patterns = [
+            r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']',
+            r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image["\']',
+            r'<meta[^>]+name=["\']twitter:image["\'][^>]+content=["\']([^"\']+)["\']',
+        ]
+        for p in patterns:
+            m = re.search(p, head, re.IGNORECASE)
+            if m:
+                img = html.unescape(m.group(1)).strip()
+                if img.startswith("//"):
+                    img = "https:" + img
+                elif img.startswith("/"):
+                    parsed = urlparse(article_url)
+                    img = f"{parsed.scheme}://{parsed.netloc}{img}"
+                if img.startswith("http"):
+                    return img
+        return None
+    except Exception as e:
+        log(f"Картинку не знайдено: {e}")
+        return None
+
+
+def build_caption(item, link):
+    parts = [f"<b>{html.escape(item['title'])}</b>"]
+    if item["source"]:
+        parts.append(f"<i>{html.escape(item['source'])}</i>")
+    parts.append("")
+    parts.append(f'<a href="{link}">Читати повністю</a>')
+    return "\n".join(parts)
+
+
+def send_photo(photo_url, caption):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
+    payload = {
+        "chat_id": CHANNEL_ID,
+        "photo": photo_url,
+        "caption": caption[:1024],
+        "parse_mode": "HTML",
+    }
+    r = requests.post(url, json=payload, timeout=40)
+    return r.json()
+
+
+def send_text(text):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": CHANNEL_ID,
         "text": text,
         "parse_mode": "HTML",
-        "disable_web_page_preview": True,
+        "disable_web_page_preview": False,
     }
     r = requests.post(url, json=payload, timeout=30)
-    data = r.json()
-    if data.get("ok"):
-        log("Дайджест опубліковано")
-        return True
-    log(f"ПОМИЛКА Telegram: {data}")
-    return False
+    return r.json()
 
 
 def main():
@@ -134,8 +183,6 @@ def main():
 
     cfg = load_sources()
     queries = cfg.get("keywords", [])
-    header = cfg.get("header", "Новини галузі")
-
     if not queries:
         log("Немає ключових слів у sources.json")
         sys.exit(1)
@@ -143,28 +190,43 @@ def main():
     seen = load_seen()
     seen_set = set(seen)
 
-    fresh = []
+    picked = None
     for q in queries:
         for item in fetch_news(q):
-            key = item["link"]
-            if key and key not in seen_set:
-                fresh.append(item)
-                seen_set.add(key)
-            if len(fresh) >= MAX_NEWS_PER_POST:
+            if item["link"] and item["link"] not in seen_set:
+                picked = item
                 break
-        if len(fresh) >= MAX_NEWS_PER_POST:
+        if picked:
             break
 
-    if not fresh:
-        log("Нових новин немає, пропускаємо публікацію")
+    if not picked:
+        log("Нових новин немає")
         sys.exit(0)
 
-    text = build_digest(fresh, header)
-    if send(text):
-        seen.extend(n["link"] for n in fresh)
-        save_seen(seen)
-        log(f"Збережено {len(fresh)} новин у пам'ять")
+    log(f"Обрано: {picked['title'][:60]}...")
+
+    real_link = resolve_url(picked["link"])
+    log(f"Посилання: {real_link[:80]}")
+
+    image = fetch_image(real_link)
+    caption = build_caption(picked, real_link)
+
+    if image:
+        log(f"Картинка: {image[:70]}")
+        res = send_photo(image, caption)
+        if not res.get("ok"):
+            log(f"Фото не пройшло ({res.get('description')}), надсилаю текстом")
+            res = send_text(caption)
     else:
+        log("Картинки немає, надсилаю текстом")
+        res = send_text(caption)
+
+    if res.get("ok"):
+        log("Опубліковано")
+        seen.append(picked["link"])
+        save_seen(seen)
+    else:
+        log(f"ПОМИЛКА Telegram: {res}")
         sys.exit(1)
 
 
