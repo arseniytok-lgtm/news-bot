@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 Telegram News Bot
-Публікує ОДНУ свіжу новину з картинкою.
-Термінові новини йдуть першими з позначкою.
+Бере новини напряму з RSS українських видань.
+Публікує: картинка + заголовок + витяг. Без посилань.
 """
 
 import html
@@ -13,7 +13,7 @@ import sys
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
-from urllib.parse import quote, urlparse
+from urllib.parse import urlparse
 from xml.etree import ElementTree
 
 import requests
@@ -26,20 +26,26 @@ CONFIG_FILE = BASE / "config.json"
 MEMORY_FILE = BASE / "memory.json"
 
 BREAKING_MINUTES = 45
-TITLE_LIMIT = 200
-MEMORY_LIMIT = 2000
+TITLE_LIMIT = 180
+SUMMARY_LIMIT = 400
+MEMORY_LIMIT = 3000
 
 BROWSER = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
 
+NS = {
+    "media": "http://search.yahoo.com/mrss/",
+    "content": "http://purl.org/rss/1.0/modules/content/",
+}
+
 
 def log(msg):
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
-# ---------- конфіг і пам'ять ----------
+# ---------- конфіг і памʼять ----------
 
 def read_config():
     if not CONFIG_FILE.exists():
@@ -59,51 +65,116 @@ def read_memory():
         return []
 
 
-def write_memory(links):
+def write_memory(items):
     with open(MEMORY_FILE, "w", encoding="utf-8") as f:
-        json.dump({"published": links[-MEMORY_LIMIT:]}, f, ensure_ascii=False, indent=2)
+        json.dump({"published": items[-MEMORY_LIMIT:]}, f, ensure_ascii=False, indent=2)
 
 
-# ---------- новини ----------
+# ---------- текст ----------
 
-def tidy_title(raw):
+def strip_tags(raw):
     text = html.unescape(raw or "")
-    text = re.sub(r"<[^>]+>", "", text)
-    text = re.sub(r"\s+-\s+[^-]+$", "", text).strip()
-    if len(text) > TITLE_LIMIT:
-        text = text[:TITLE_LIMIT].rsplit(" ", 1)[0] + "…"
-    return text
+    text = re.sub(r"<br\s*/?>", " ", text, flags=re.I)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"&nbsp;?", " ", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
 
 
-def search_news(query):
-    url = (
-        "https://news.google.com/rss/search?"
-        f"q={quote(query)}&hl=uk&gl=UA&ceid=UA:uk"
-    )
+def cut(text, limit):
+    if len(text) <= limit:
+        return text
+    piece = text[:limit]
+    for sep in (". ", "! ", "? "):
+        pos = piece.rfind(sep)
+        if pos > limit * 0.5:
+            return piece[: pos + 1]
+    return piece.rsplit(" ", 1)[0] + "…"
+
+
+# ---------- читання стрічок ----------
+
+def find_image(node, description_html):
+    """Шукає картинку в різних форматах RSS."""
+    for tag in ("media:content", "media:thumbnail"):
+        found = node.find(tag, NS)
+        if found is not None:
+            url = found.get("url")
+            if url and url.startswith("http"):
+                return url
+
+    enclosure = node.find("enclosure")
+    if enclosure is not None:
+        url = enclosure.get("url", "")
+        mime = enclosure.get("type", "")
+        if url.startswith("http") and ("image" in mime or not mime):
+            return url
+
+    if description_html:
+        match = re.search(r'<img[^>]+src=["\']([^"\']+)["\']', description_html, re.I)
+        if match:
+            url = html.unescape(match.group(1))
+            if url.startswith("//"):
+                url = "https:" + url
+            if url.startswith("http"):
+                return url
+
+    encoded = node.find("content:encoded", NS)
+    if encoded is not None and encoded.text:
+        match = re.search(r'<img[^>]+src=["\']([^"\']+)["\']', encoded.text, re.I)
+        if match:
+            url = html.unescape(match.group(1))
+            if url.startswith("//"):
+                url = "https:" + url
+            if url.startswith("http"):
+                return url
+
+    return None
+
+
+def read_feed(url):
     try:
         resp = requests.get(url, timeout=20, headers={"User-Agent": BROWSER})
-        resp.raise_for_status()
+        if resp.status_code != 200:
+            log(f"{urlparse(url).netloc}: код {resp.status_code}")
+            return []
         root = ElementTree.fromstring(resp.content)
-        found = []
+
+        source_name = ""
+        channel_title = root.find(".//channel/title")
+        if channel_title is not None and channel_title.text:
+            source_name = channel_title.text.strip()
+
+        items = []
         for node in root.findall(".//item"):
-            title = node.find("title")
-            link = node.find("link")
-            source = node.find("source")
-            pubdate = node.find("pubDate")
-            if title is None or link is None:
+            title_el = node.find("title")
+            link_el = node.find("link")
+            if title_el is None or not title_el.text:
                 continue
-            found.append({
-                "title": tidy_title(title.text),
-                "link": (link.text or "").strip(),
-                "source": (source.text if source is not None else "") or "",
-                "pubdate": (pubdate.text if pubdate is not None else "") or "",
+
+            desc_el = node.find("description")
+            desc_raw = desc_el.text if desc_el is not None else ""
+
+            date_el = node.find("pubDate")
+
+            items.append({
+                "title": cut(strip_tags(title_el.text), TITLE_LIMIT),
+                "summary": cut(strip_tags(desc_raw), SUMMARY_LIMIT),
+                "link": (link_el.text or "").strip() if link_el is not None else "",
+                "image": find_image(node, desc_raw or ""),
+                "source": source_name,
+                "pubdate": (date_el.text if date_el is not None else "") or "",
             })
-        log(f"'{query}' — знайдено {len(found)}")
-        return found
+
+        log(f"{urlparse(url).netloc}: {len(items)} новин")
+        return items
+
     except Exception as exc:
-        log(f"Помилка пошуку '{query}': {exc}")
+        log(f"{urlparse(url).netloc}: помилка — {exc}")
         return []
 
+
+# ---------- терміновість ----------
 
 def minutes_old(pubdate):
     if not pubdate:
@@ -118,9 +189,9 @@ def minutes_old(pubdate):
 
 
 def check_breaking(item, words):
-    lowered = item["title"].lower()
+    haystack = (item["title"] + " " + item["summary"]).lower()
     for word in words:
-        if word.lower() in lowered:
+        if word.lower() in haystack:
             return True, f"слово '{word}'"
     age = minutes_old(item["pubdate"])
     if age is not None and age <= BREAKING_MINUTES:
@@ -128,79 +199,51 @@ def check_breaking(item, words):
     return False, ""
 
 
-# ---------- посилання і картинка ----------
+# ---------- запасна картинка зі сторінки ----------
 
-def unwrap_link(google_url):
-    """Розгортає Google News у справжню адресу статті."""
-    try:
-        resp = requests.get(
-            google_url, timeout=15, headers={"User-Agent": BROWSER}, allow_redirects=True
-        )
-        final = resp.url
-        if "news.google.com" in final:
-            match = re.search(
-                r'<a[^>]+href="(https?://(?!news\.google|www\.google)[^"]+)"', resp.text
-            )
-            if match:
-                final = html.unescape(match.group(1))
-            else:
-                match = re.search(r'data-n-au="(https?://[^"]+)"', resp.text)
-                if match:
-                    final = html.unescape(match.group(1))
-        return final
-    except Exception as exc:
-        log(f"Не вдалось розгорнути посилання: {exc}")
-        return google_url
-
-
-def grab_image(page_url):
-    """Дістає превʼю-картинку зі сторінки статті."""
-    if "news.google.com" in page_url:
-        log("Посилання не розгорнулось, картинки не буде")
+def page_image(page_url):
+    if not page_url:
         return None
     try:
         resp = requests.get(page_url, timeout=15, headers={"User-Agent": BROWSER})
         if resp.status_code != 200:
-            log(f"Сторінка віддала {resp.status_code}")
             return None
         head = resp.text[:250000]
         patterns = [
             r'<meta[^>]+property=["\']og:image["\'][^>]*content=["\']([^"\']+)["\']',
             r'<meta[^>]*content=["\']([^"\']+)["\'][^>]*property=["\']og:image["\']',
             r'<meta[^>]+name=["\']twitter:image["\'][^>]*content=["\']([^"\']+)["\']',
-            r'<meta[^>]+property=["\']og:image:url["\'][^>]*content=["\']([^"\']+)["\']',
         ]
         for pattern in patterns:
             match = re.search(pattern, head, re.IGNORECASE)
-            if not match:
-                continue
-            image = html.unescape(match.group(1)).strip()
-            if image.startswith("//"):
-                image = "https:" + image
-            elif image.startswith("/"):
-                parts = urlparse(page_url)
-                image = f"{parts.scheme}://{parts.netloc}{image}"
-            if image.startswith("http"):
-                return image
-        log("og:image на сторінці немає")
+            if match:
+                image = html.unescape(match.group(1)).strip()
+                if image.startswith("//"):
+                    image = "https:" + image
+                elif image.startswith("/"):
+                    parts = urlparse(page_url)
+                    image = f"{parts.scheme}://{parts.netloc}{image}"
+                if image.startswith("http"):
+                    return image
         return None
-    except Exception as exc:
-        log(f"Не вдалось отримати картинку: {exc}")
+    except Exception:
         return None
 
 
 # ---------- публікація ----------
 
-def make_text(item, link, urgent):
+def make_text(item, urgent):
     lines = []
     if urgent:
         lines.append("🔴 <b>ТЕРМІНОВО</b>")
         lines.append("")
     lines.append(f"<b>{html.escape(item['title'])}</b>")
-    lines.append("")
+    if item["summary"] and item["summary"].lower() != item["title"].lower():
+        lines.append("")
+        lines.append(html.escape(item["summary"]))
     if item["source"]:
-        lines.append(f"Джерело: {html.escape(item['source'])}")
-    lines.append(f'<a href="{link}">Читати повністю</a>')
+        lines.append("")
+        lines.append(f"<i>{html.escape(item['source'])}</i>")
     return "\n".join(lines)
 
 
@@ -221,7 +264,7 @@ def publish_text(text):
         "chat_id": CHANNEL,
         "text": text,
         "parse_mode": "HTML",
-        "disable_web_page_preview": False,
+        "disable_web_page_preview": True,
     }
     return requests.post(api, json=body, timeout=30).json()
 
@@ -234,22 +277,24 @@ def main():
         sys.exit(1)
 
     config = read_config()
-    queries = config.get("keywords", [])
+    feeds = config.get("feeds", [])
     urgent_words = config.get("breaking_words", [])
 
-    if not queries:
-        log("ПОМИЛКА: у config.json немає keywords")
+    if not feeds:
+        log("ПОМИЛКА: у config.json немає feeds")
         sys.exit(1)
 
     published = read_memory()
     known = set(published)
 
     fresh = []
-    for query in queries:
-        for item in search_news(query):
-            if item["link"] and item["link"] not in known:
+    for feed in feeds:
+        for item in read_feed(feed):
+            key = item["link"] or item["title"]
+            if key and key not in known:
+                item["key"] = key
                 fresh.append(item)
-                known.add(item["link"])
+                known.add(key)
 
     if not fresh:
         log("Нових новин немає")
@@ -271,14 +316,19 @@ def main():
 
     log(f"Публікуємо: {chosen['title'][:70]}")
 
-    article_url = unwrap_link(chosen["link"])
-    log(f"Стаття: {article_url[:90]}")
+    image = chosen["image"]
+    if image:
+        log(f"Картинка з RSS: {image[:80]}")
+    else:
+        image = page_image(chosen["link"])
+        if image:
+            log(f"Картинка зі сторінки: {image[:80]}")
+        else:
+            log("Картинки немає")
 
-    image = grab_image(article_url)
-    text = make_text(chosen, article_url, urgent)
+    text = make_text(chosen, urgent)
 
     if image:
-        log(f"Картинка знайдена: {image[:80]}")
         result = publish_photo(image, text)
         if not result.get("ok"):
             log(f"Фото не пройшло ({result.get('description')}), надсилаю текстом")
@@ -288,7 +338,7 @@ def main():
 
     if result.get("ok"):
         log("Опубліковано успішно")
-        published.append(chosen["link"])
+        published.append(chosen["key"])
         write_memory(published)
     else:
         log(f"ПОМИЛКА Telegram: {result}")
