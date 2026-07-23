@@ -1,0 +1,27 @@
+name: Новини
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/15 * * * *"
+permissions:
+  contents: write
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: pip install requests
+      - run: python news.py
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHANNEL_ID: ${{ secrets.TG_CHANNEL_ID }}
+      - run: |
+          git config user.name "news-bot"
+          git config user.email "bot@users.noreply.github.com"
+          git pull --rebase --autostash || true
+          git add memory.json || true
+          git diff --staged --quiet || git commit -m "published [skip ci]"
+          git push || true
