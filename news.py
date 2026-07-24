@@ -238,9 +238,6 @@ def page_image(page_url):
 
 def make_text(item, urgent):
     lines = []
-    if urgent:
-        lines.append("🔴 <b>ТЕРМІНОВО</b>")
-        lines.append("")
     lines.append(f"<b>{html.escape(item['title'])}</b>")
     if item["summary"] and item["summary"].lower() != item["title"].lower():
         lines.append("")
