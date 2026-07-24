@@ -11,6 +11,7 @@ import os
 import re
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
@@ -33,7 +34,7 @@ PAUSE_BETWEEN = 3
 
 TITLE_LIMIT = 180
 SUMMARY_LIMIT = 400
-MEMORY_LIMIT = 3000
+MEMORY_LIMIT = 8000
 
 BROWSER = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -139,7 +140,7 @@ def find_image(node, description_html):
 
 def read_feed(url):
     try:
-        resp = requests.get(url, timeout=20, headers={"User-Agent": BROWSER})
+        resp = requests.get(url, timeout=12, headers={"User-Agent": BROWSER})
         if resp.status_code != 200:
             log(f"{urlparse(url).netloc}: код {resp.status_code}")
             return []
@@ -290,9 +291,13 @@ def main():
     published = read_memory()
     known = set(published)
 
+    # Читаємо стрічки паралельно, інакше 24 джерела довго
     fresh = []
-    for feed in feeds:
-        for item in read_feed(feed):
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(read_feed, feeds))
+
+    for batch in results:
+        for item in batch:
             key = item["link"] or item["title"]
             if key and key not in known:
                 item["key"] = key
@@ -317,8 +322,21 @@ def main():
         else:
             normal_list.append(item)
 
-    normal_list.sort(key=lambda x: minutes_old(x["pubdate"]) or 99999)
-    queue = urgent_list + normal_list
+    # Чергуємо джерела: по одній новині від кожного по колу
+    def interleave(items):
+        by_source = {}
+        for it in items:
+            by_source.setdefault(it["source"] or "?", []).append(it)
+        for lst in by_source.values():
+            lst.sort(key=lambda x: minutes_old(x["pubdate"]) or 99999)
+        mixed = []
+        while any(by_source.values()):
+            for name in list(by_source.keys()):
+                if by_source[name]:
+                    mixed.append(by_source[name].pop(0))
+        return mixed
+
+    queue = interleave(urgent_list) + interleave(normal_list)
 
     to_post = queue[:POSTS_PER_RUN]
     log(f"Публікуємо {len(to_post)} з них (термінових: {len(urgent_list)})")
