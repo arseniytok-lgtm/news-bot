@@ -10,6 +10,7 @@ import json
 import os
 import re
 import sys
+import time
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
@@ -25,7 +26,11 @@ BASE = Path(__file__).parent
 CONFIG_FILE = BASE / "config.json"
 MEMORY_FILE = BASE / "memory.json"
 
-BREAKING_MINUTES = 45
+# Скільки новин публікувати за один запуск
+POSTS_PER_RUN = 4
+# Пауза між постами, секунд
+PAUSE_BETWEEN = 3
+
 TITLE_LIMIT = 180
 SUMMARY_LIMIT = 400
 MEMORY_LIMIT = 3000
@@ -189,13 +194,11 @@ def minutes_old(pubdate):
 
 
 def check_breaking(item, words):
-    haystack = (item["title"] + " " + item["summary"]).lower()
+    """Термінова тільки якщо є слово-маркер у заголовку."""
+    haystack = item["title"].lower()
     for word in words:
         if word.lower() in haystack:
             return True, f"слово '{word}'"
-    age = minutes_old(item["pubdate"])
-    if age is not None and age <= BREAKING_MINUTES:
-        return True, f"свіжа, {int(age)} хв"
     return False, ""
 
 
@@ -302,46 +305,57 @@ def main():
 
     log(f"Нових новин у черзі: {len(fresh)}")
 
-    chosen = None
-    urgent = False
+    # Спочатку термінові, потім свіжі за датою
+    urgent_list = []
+    normal_list = []
     for item in fresh:
         flag, reason = check_breaking(item, urgent_words)
+        item["urgent"] = flag
         if flag:
-            chosen, urgent = item, True
-            log(f"ТЕРМІНОВА ({reason})")
-            break
-
-    if chosen is None:
-        chosen = fresh[0]
-
-    log(f"Публікуємо: {chosen['title'][:70]}")
-
-    image = chosen["image"]
-    if image:
-        log(f"Картинка з RSS: {image[:80]}")
-    else:
-        image = page_image(chosen["link"])
-        if image:
-            log(f"Картинка зі сторінки: {image[:80]}")
+            item["reason"] = reason
+            urgent_list.append(item)
         else:
-            log("Картинки немає")
+            normal_list.append(item)
 
-    text = make_text(chosen, urgent)
+    normal_list.sort(key=lambda x: minutes_old(x["pubdate"]) or 99999)
+    queue = urgent_list + normal_list
 
-    if image:
-        result = publish_photo(image, text)
-        if not result.get("ok"):
-            log(f"Фото не пройшло ({result.get('description')}), надсилаю текстом")
+    to_post = queue[:POSTS_PER_RUN]
+    log(f"Публікуємо {len(to_post)} з них (термінових: {len(urgent_list)})")
+
+    sent = 0
+    for idx, item in enumerate(to_post):
+        if item["urgent"]:
+            log(f"ТЕРМІНОВА ({item['reason']}): {item['title'][:60]}")
+        else:
+            log(f"Звичайна: {item['title'][:60]}")
+
+        image = item["image"] or page_image(item["link"])
+        text = make_text(item, item["urgent"])
+
+        if image:
+            result = publish_photo(image, text)
+            if not result.get("ok"):
+                log(f"  фото не пройшло ({result.get('description')}), текстом")
+                result = publish_text(text)
+        else:
             result = publish_text(text)
-    else:
-        result = publish_text(text)
 
-    if result.get("ok"):
-        log("Опубліковано успішно")
-        published.append(chosen["key"])
+        if result.get("ok"):
+            published.append(item["key"])
+            sent += 1
+            log("  опубліковано")
+        else:
+            log(f"  ПОМИЛКА: {result.get('description')}")
+
+        if idx < len(to_post) - 1:
+            time.sleep(PAUSE_BETWEEN)
+
+    if sent:
         write_memory(published)
+        log(f"Готово, надіслано {sent}")
     else:
-        log(f"ПОМИЛКА Telegram: {result}")
+        log("Нічого не надіслано")
         sys.exit(1)
 
 
